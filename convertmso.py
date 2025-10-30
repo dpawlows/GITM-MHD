@@ -1,21 +1,46 @@
 #!/usr/bin/env python
-from glob import glob
-from matplotlib import pyplot
 import spiceypy as spice
-from scipy.interpolate import RegularGridInterpolator
+from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+from scipy.spatial import Delaunay
 import numpy as np
-import pickle
 import time
 import sys
 import re
 from coordinates import *
 
 #Hard coded resolution
-latres = 3 #degrees
-lonres = 3 #degrees
-altres = 10 #km
+latres = 3  # degrees
+lonres = 3  # degrees
+altres = 10  # km
 print("Warning! Resolution is assumed to be {} lon x {} lat x {} alt".format(lonres,latres,altres))
 time.sleep(1)
+
+
+def nearest_index(value, start, step, count):
+    """Return the index of the closest value on a regularly spaced grid."""
+    idx = int(np.floor((value - start) / step + 0.5))
+    return min(max(idx, 0), count - 1)
+
+
+def fill_with_interpolation(values, mask, known_points, known_values, missing_coords, tri):
+    """Fill missing grid cells in a single altitude slice."""
+    if known_points.size == 0 or missing_coords.size == 0:
+        return values
+
+    filled = values.copy()
+
+    linear_values = np.full(missing_coords.shape[0], np.nan)
+    if tri is not None:
+        linear_interp = LinearNDInterpolator(tri, known_values)
+        linear_values = linear_interp(missing_coords)
+
+    need_nearest = np.isnan(linear_values)
+    if np.any(need_nearest):
+        nearest_interp = NearestNDInterpolator(known_points, known_values)
+        linear_values[need_nearest] = nearest_interp(missing_coords[need_nearest])
+
+    filled[~mask] = linear_values
+    return filled
 
 dpr = spice.dpr()
 
@@ -64,33 +89,24 @@ sslatitude = sppc[2]
 # sslat = sppc[2]
 # sslong =  sppc[1]
 inclination = 25.91 / dpr
-longitude = np.arange(0,360,lonres)
-latitude = np.arange(-90,91,latres)
-altitude = np.arange(100,301,altres)
-bTotalEast = np.zeros((len(longitude),len(latitude),len(altitude)))
-bTotalNorth = np.zeros((len(longitude),len(latitude),len(altitude)))
-bTotalUp= np.zeros((len(longitude),len(latitude),len(altitude)))
-# bMagnitude = np.zeros((len(longitude),len(latitude),len(altitude)))
-# bElevation = np.zeros((len(longitude),len(latitude),len(altitude)))
-bType = np.zeros((len(longitude),len(latitude),len(altitude)),int)
+longitude = np.arange(0, 360, lonres)
+latitude = np.arange(-90, 91, latres)
+altitude = np.arange(100, 301, altres)
+grid_shape = (len(longitude), len(latitude), len(altitude))
+
+bTotalEast = np.zeros(grid_shape)
+bTotalNorth = np.zeros(grid_shape)
+bTotalUp = np.zeros(grid_shape)
+bType = np.zeros(grid_shape, int)
+sample_counts = np.zeros(grid_shape, dtype=np.int32)
+
+lon_grid, lat_grid = np.meshgrid(longitude, latitude, indexing='ij')
 
 
 ## Read the MHD file
 endoffile = False
 line = 0
-maxlon = -1e9
-minlon = 1e9
-maxlong = -10
-maxlat = -1e9
-minlat = 1e9
-bmax = 0
-B = []
-loc = []
-msox = []
-msoy = []
-msoz = []
-bmag = []
-btyp = []
+
 
 while not endoffile:
     temp1 = f.readline()
@@ -115,32 +131,27 @@ while not endoffile:
         Xgcm = convertMSO2GCM(x,y,z,sslongitude,sslatitude,inclination,ls)
         #
         # breakpoint()
-        alts = np.linalg.norm(Xgcm)
-        lon = np.arctan2(Xgcm[1],Xgcm[0])#-sslong
+        lon = np.arctan2(Xgcm[1], Xgcm[0])
         if lon < 0:
-            lon += 2*np.pi
-        lat = np.arcsin(Xgcm[2]/alts)
-        alts = (alt*radius)-radius
+            lon += 2 * np.pi
+        lat = np.arcsin(Xgcm[2] / np.linalg.norm(Xgcm))
 
         Bgcm = convertMSO2GCM(bx,by,bz,sslongitude,sslatitude,inclination,ls)
         totalFieldUp,totalFieldNorth,totalFieldEast = convertVector(Bgcm,lat,lon)
         totalFieldNorth = -totalFieldNorth
 
-        if alt > 100 and alt <= 300:
-            ilon = (np.abs(longitude-lon*dpr)).argmin()
-            ilat = (np.abs(latitude-lat*dpr)).argmin()
-            ialt = (np.abs(altitude-alt)).argmin()
-            if lon > 358.5/dpr and longitude[0] == 0:
-                ilon = 0
-                lon = 0
-            if (np.abs(longitude[ilon]-lon*dpr) > 2 or np.abs(latitude[ilat]-lat*dpr >2) or \
-                np.abs(altitude[ialt]-alt) > 5):
-                print("issue with grid?")
-                breakpoint()
-            bTotalUp[ilon,ilat,ialt] = totalFieldUp
-            bTotalEast[ilon,ilat,ialt] = totalFieldEast
-            bTotalNorth[ilon,ilat,ialt] = totalFieldNorth
-            bType[ilon,ilat,ialt] = type
+        if 100 <= alt <= 300:
+            lon_deg = (lon * dpr) % 360.0
+            lat_deg = lat * dpr
+            ilon = int(np.floor((lon_deg + lonres / 2.0) / lonres)) % len(longitude)
+            ilat = nearest_index(lat_deg, latitude[0], latres, len(latitude))
+            ialt = nearest_index(alt, altitude[0], altres, len(altitude))
+
+            sample_counts[ilon, ilat, ialt] += 1
+            bTotalUp[ilon, ilat, ialt] += totalFieldUp
+            bTotalEast[ilon, ilat, ialt] += totalFieldEast
+            bTotalNorth[ilon, ilat, ialt] += totalFieldNorth
+            bType[ilon, ilat, ialt] = type
 
 
         if line % 1000 == 0:
@@ -149,74 +160,87 @@ while not endoffile:
         line += 1
 f.close()
 
+valid_mask = sample_counts > 0
+
+with np.errstate(invalid='ignore'):
+    bTotalEast[valid_mask] /= sample_counts[valid_mask]
+    bTotalNorth[valid_mask] /= sample_counts[valid_mask]
+    bTotalUp[valid_mask] /= sample_counts[valid_mask]
+
+for ialt in range(len(altitude)):
+    mask = valid_mask[:, :, ialt]
+    missing = ~mask
+    if not np.any(missing):
+        continue
+
+    known_points = np.column_stack((lon_grid[mask], lat_grid[mask]))
+    if known_points.size == 0:
+        continue
+
+    missing_coords = np.column_stack((lon_grid[missing], lat_grid[missing]))
+    tri = Delaunay(known_points) if known_points.shape[0] >= 3 else None
+
+    bTotalEast[:, :, ialt] = fill_with_interpolation(
+        bTotalEast[:, :, ialt],
+        mask,
+        known_points,
+        bTotalEast[:, :, ialt][mask],
+        missing_coords,
+        tri,
+    )
+    bTotalNorth[:, :, ialt] = fill_with_interpolation(
+        bTotalNorth[:, :, ialt],
+        mask,
+        known_points,
+        bTotalNorth[:, :, ialt][mask],
+        missing_coords,
+        tri,
+    )
+    bTotalUp[:, :, ialt] = fill_with_interpolation(
+        bTotalUp[:, :, ialt],
+        mask,
+        known_points,
+        bTotalUp[:, :, ialt][mask],
+        missing_coords,
+        tri,
+    )
+
+    type_interp = NearestNDInterpolator(known_points, bType[:, :, ialt][mask])
+    filled_types = bType[:, :, ialt].astype(float)
+    filled_types[missing] = type_interp(missing_coords)
+    bType[:, :, ialt] = np.rint(filled_types).astype(int)
+
+magnitude = np.sqrt(bTotalEast**2 + bTotalNorth**2 + bTotalUp**2)
+izero = int(np.count_nonzero(magnitude == 0))
+
 f2.write("Lon(rad)  Lat(rad)  Alt(km) Bup  Bnorth  Beast  Btype\n")
 f2.write("#START\n")
-i = 0
-izero = 0
+total_cells = np.prod(grid_shape)
 for ilon in range(len(longitude)):
     for ilat in range(len(latitude)):
         for ialt in range(len(altitude)):
+            if bType[ilon, ilat, ialt] == 0:
+                bType[ilon, ilat, ialt] = 4
 
+            if bTotalEast[ilon, ilat, ialt] == 0:
+                bTotalEast[ilon, ilat, ialt] = 1e-3
+            if bTotalNorth[ilon, ilat, ialt] == 0:
+                bTotalNorth[ilon, ilat, ialt] = 1e-3
+            if bTotalUp[ilon, ilat, ialt] == 0:
+                bTotalUp[ilon, ilat, ialt] = 1e-3
 
-            if ilon > 0 and ilat > 0 and ilon < len(longitude)-1 and ilat < len(latitude)-1:
-                bMagnitude =np.linalg.norm([bTotalUp[ilon,ilat,ialt],\
-                    bTotalEast[ilon,ilat,ialt],bTotalNorth[ilon,ilat,ialt]])
+            f2.write(
+                "{:9.3f} {:9.3f} {:9.3f} {:9.3f} {:9.3f} {:9.3f} {:d}\n".format(
+                    longitude[ilon] / dpr,
+                    latitude[ilat] / dpr,
+                    altitude[ialt],
+                    bTotalEast[ilon, ilat, ialt],
+                    bTotalNorth[ilon, ilat, ialt],
+                    bTotalUp[ilon, ilat, ialt],
+                    bType[ilon, ilat, ialt],
+                )
+            )
 
-                if bMagnitude == 0:
-                    izero += 1
-
-                    # East
-                    x = [longitude[ilon-1], longitude[ilon+1]]
-                    y = [latitude[ilat-1], latitude[ilat+1]]
-                    Z = [
-                        [bTotalEast[ilon-1, ilat-1, ialt], bTotalEast[ilon-1, ilat+1, ialt]],
-                        [bTotalEast[ilon+1, ilat-1, ialt], bTotalEast[ilon+1, ilat+1, ialt]]
-                    ]
-
-                    f = RegularGridInterpolator((x, y), Z, method='linear', bounds_error=False, fill_value=None)
-                    bTotalEast[ilon,ilat,ialt] = float(f((longitude[ilon], latitude[ilat])))
-
-                    # North
-                    Z = [
-                        [bTotalNorth[ilon-1, ilat-1, ialt], bTotalNorth[ilon-1, ilat+1, ialt]],
-                        [bTotalNorth[ilon+1, ilat-1, ialt], bTotalNorth[ilon+1, ilat+1, ialt]]
-                    ]
-
-                    f = RegularGridInterpolator((x, y), Z, method='linear', bounds_error=False, fill_value=None)
-                    bTotalNorth[ilon,ilat,ialt] = float(f((longitude[ilon], latitude[ilat])))
-
-                    # Up
-                    Z = [
-                        [bTotalUp[ilon-1, ilat-1, ialt], bTotalUp[ilon-1, ilat+1, ialt]],
-                        [bTotalUp[ilon+1, ilat-1, ialt], bTotalUp[ilon+1, ilat+1, ialt]]
-                    ]
-
-                    f = RegularGridInterpolator((x, y), Z, method='linear', bounds_error=False, fill_value=None)
-                    bTotalUp[ilon,ilat,ialt] = float(f((longitude[ilon], latitude[ilat])))
-
-
-                    if abs(longitude[ilon] - longitude[ilon-1]) < abs(longitude[ilon+1] - longitude[ilon]):
-                        thislon = ilon-1
-                    else:
-                        thislon = ilon+1
-                    if abs(latitude[ilat] - latitude[ilat-1]) < abs(latitude[ilat+1] - latitude[ilat]):
-                        thislat = ilat-1
-                    else:
-                        thislat = ilat+1
-                    bType[ilon,ilat,ialt] = bType[thislon,thislat,ialt]
-
-            if bType[ilon,ilat,ialt] == 0:
-                bType[ilon,ilat,ialt] = 4
-            bTotalEast[ilon,ilat,ialt] = 1e-3 if  bTotalEast[ilon,ilat,ialt] == 0 else  bTotalEast[ilon,ilat,ialt]
-            bTotalNorth[ilon,ilat,ialt] = 1e-3 if bTotalNorth[ilon,ilat,ialt] == 0 else bTotalNorth[ilon,ilat,ialt]
-            bTotalUp[ilon,ilat,ialt] = 1e-3 if    bTotalUp[ilon,ilat,ialt] == 0 else    bTotalUp[ilon,ilat,ialt]
-
-            f2.write("{:9.3f} {:9.3f} {:9.3f} {:9.3f} {:9.3f} {:9.3f} {:d}\n".format(\
-            longitude[ilon]/dpr,latitude[ilat]/dpr,\
-            altitude[ialt],bTotalEast[ilon,ilat,ialt],bTotalNorth[ilon,ilat,ialt],\
-            bTotalUp[ilon,ilat,ialt],\
-            bType[ilon,ilat,ialt]))
-            i+=1
-print("{} zeros out of {}".format(izero,i))
+print("{} zeros out of {}".format(izero, total_cells))
 
 f2.close()
